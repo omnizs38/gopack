@@ -1,8 +1,8 @@
 # gopack
 
-![GitHub Workflow Status](https://shields.io)
-![GitHub License](https://shields.io)
-![GitHub Top Language](https://shields.io)
+![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/omnizs38/gopack/go.yml?branch=main)
+![GitHub License](https://img.shields.io/github/license/omnizs38/gopack)
+![GitHub Top Language](https://img.shields.io/github/languages/top/omnizs38/gopack)
 
 A minimalist, high-performance Windows installer builder written in Go. Uses binary fusion to merge executable logic with app payload into a single, UAC-free `setup.exe`. 
 
