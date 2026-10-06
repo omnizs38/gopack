@@ -1,10 +1,13 @@
+//go:build windows
+
+// Command extractor is the installer stub. It is distributed as a template
+// binary; the packer appends an LZ4-compressed payload and a footer to it.
+// The same binary doubles as the uninstaller when copied to uninstall.exe
+// or invoked with --uninstall.
 package main
 
 import (
 	"archive/zip"
-	"bytes"
-	"encoding/binary"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"image/color"
@@ -16,7 +19,9 @@ import (
 	"sync"
 	"syscall"
 
-	"gopack/internal/metadata"
+	"github.com/omnizs38/gopack/internal/bundle"
+	"github.com/omnizs38/gopack/internal/install"
+	"github.com/omnizs38/gopack/internal/metadata"
 
 	"gioui.org/app"
 	"gioui.org/layout"
@@ -25,248 +30,333 @@ import (
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
-	"github.com/pierrec/lz4/v4"
 	"golang.org/x/sys/windows/registry"
 )
 
 type installState int
 
 const (
-    StateIdle installState = iota
-    StateInstalling
-    StateDone
+	stateIdle installState = iota
+	stateInstalling
+	stateDone
+	stateFailed
 )
 
-var (
-    currentState installState = StateIdle
-    progressValue float32
-    statusText    string = "Ready to install"
-    uiMutex       sync.Mutex
-)
-
-func main() {
-    uninstallMode := flag.Bool("uninstall", false, "Run uninstaller")
-    flag.Parse()
-
-    exeName := filepath.Base(os.Args[0])
-    if *uninstallMode || exeName == "uninstall.exe" {
-        runUninstaller()
-        return
-    }
-
-    go runInstallerGUI()
-    app.Main()
+var ui struct {
+	sync.Mutex
+	state    installState
+	progress float32
+	status   string
 }
 
-func getEmbeddedData() (metadata.Metadata, *zip.Reader, error) {
-    var meta metadata.Metadata
-    exePath, _ := os.Executable()
-    file, _ := os.Open(exePath)
-    defer file.Close()
-    info, _ := file.Stat()
+func setStatus(state installState, progress float32, status string) {
+	ui.Lock()
+	ui.state, ui.progress, ui.status = state, progress, status
+	ui.Unlock()
+}
 
-    footerSize := int64(14)
-    footer := make([]byte, footerSize)
-    _, err := file.ReadAt(footer, info.Size()-footerSize)
-    if err != nil || string(footer[8:14]) != "GPKLZ4" {
-        return meta, nil, fmt.Errorf("GPKLZ4 magic not found")
-    }
+func main() {
+	// GUI apps have no console; keep a log file next to the binary so
+	// failures are diagnosable.
+	if exePath, err := os.Executable(); err == nil {
+		logPath := filepath.Join(filepath.Dir(exePath), "install_log.txt")
+		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+			defer f.Close()
+			log.SetOutput(f)
+		}
+	}
 
-    lz4Size := int64(binary.LittleEndian.Uint64(footer[:8]))
-    lz4Start := info.Size() - footerSize - lz4Size
+	uninstallMode := flag.Bool("uninstall", false, "Run uninstaller")
+	flag.Parse()
 
-    lz4Data := make([]byte, lz4Size)
-    _, err = file.ReadAt(lz4Data, lz4Start)
-    if err != nil {
-        return meta, nil, err
-    }
+	exeName := filepath.Base(os.Args[0])
+	if *uninstallMode || exeName == "uninstall.exe" {
+		if err := runUninstaller(); err != nil {
+			log.Printf("uninstall failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
 
-    zr := lz4.NewReader(bytes.NewReader(lz4Data))
-    var zipBuf bytes.Buffer
-    io.Copy(&zipBuf, zr)
+	go runInstallerGUI()
+	app.Main()
+}
 
-    zipReader, err := zip.NewReader(bytes.NewReader(zipBuf.Bytes()), int64(zipBuf.Len()))
-    if err != nil {
-        return meta, nil, err
-    }
+// loadPayload reads the embedded metadata and archive from the running exe.
+func loadPayload() (metadata.Metadata, *zip.Reader, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return metadata.Metadata{}, nil, fmt.Errorf("locating executable: %w", err)
+	}
+	file, err := os.Open(exePath)
+	if err != nil {
+		return metadata.Metadata{}, nil, fmt.Errorf("opening executable: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return metadata.Metadata{}, nil, err
+	}
 
-    for _, f := range zipReader.File {
-        if f.Name == "__metadata.json" {
-            rc, _ := f.Open()
-            json.NewDecoder(rc).Decode(&meta)
-            rc.Close()
-            break
-        }
-    }
-    return meta, zipReader, nil
+	zipReader, err := bundle.Read(file, info.Size())
+	if err != nil {
+		return metadata.Metadata{}, nil, err
+	}
+
+	var meta metadata.Metadata
+	for _, f := range zipReader.File {
+		if f.Name == metadata.MetadataFile {
+			rc, err := f.Open()
+			if err != nil {
+				return meta, nil, err
+			}
+			defer rc.Close()
+			var data []byte
+			data, err = io.ReadAll(rc)
+			if err != nil {
+				return meta, nil, err
+			}
+			meta, err = metadata.Decode(data)
+			if err != nil {
+				return meta, nil, fmt.Errorf("parsing metadata: %w", err)
+			}
+			return meta, zipReader, meta.Validate()
+		}
+	}
+	return meta, nil, fmt.Errorf("%s not found in payload", metadata.MetadataFile)
 }
 
 func runInstallerGUI() {
-    meta, zipReader, err := getEmbeddedData()
-    if err != nil {
-        log.Fatal("Error reading embedded data:", err)
-    }
+	meta, zipReader, err := loadPayload()
+	if err != nil {
+		// No payload: someone ran the bare template. Not fatal for the log,
+		// but there is nothing to install.
+		log.Printf("error reading embedded data: %v", err)
+		meta = metadata.Metadata{AppName: "gopack"}
+		setStatus(stateFailed, 0, "This installer is corrupt or incomplete.")
+	} else {
+		setStatus(stateIdle, 0, "Ready to install "+meta.AppName+" "+meta.AppVersion)
+	}
 
-    w := new(app.Window)
-    w.Option(app.Title(meta.AppName + " Setup"))
-    w.Option(app.Size(unit.Dp(400), unit.Dp(150)))
-    
-    th := material.NewTheme()
-    var ops op.Ops
+	w := new(app.Window)
+	w.Option(app.Title(meta.AppName+" Setup"), app.Size(unit.Dp(420), unit.Dp(160)))
 
-    installBtn := new(widget.Clickable)
+	th := material.NewTheme()
+	var ops op.Ops
+	installBtn := new(widget.Clickable)
 
-    for {
-        e := w.Event()
-        switch e := e.(type) {
-        case app.FrameEvent:
-            gtx := app.NewContext(&ops, e)
+	for {
+		e := w.Event()
+		switch e := e.(type) {
+		case app.FrameEvent:
+			gtx := app.NewContext(&ops, e)
 
-            if installBtn.Clicked(gtx) {
-                switch currentState {
-                case StateIdle:
-                    currentState = StateInstalling
-                    go performInstallation(meta, zipReader, w)
-                case StateDone:
-                    os.Exit(0)
-                }
-            }
+			ui.Lock()
+			state := ui.state
+			ui.Unlock()
 
-            layout.Flex{Axis: layout.Vertical, Spacing: layout.SpaceAround}.Layout(gtx,
-                layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-                    uiMutex.Lock()
-                    defer uiMutex.Unlock()
-                    lbl := material.H6(th, statusText)
-                    lbl.Alignment = text.Middle
-                    return lbl.Layout(gtx)
-                }),
-                layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-                    if currentState == StateInstalling {
-                        return material.ProgressBar(th, progressValue).Layout(gtx)
-                    }
-                    return layout.Dimensions{}
-                }),
-                layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-                    var btnText string
-                    switch currentState {
-                    case StateInstalling:
-                        btnText = "Installing..."
-                    case StateDone:
-                        btnText = "Close"
-                    default:
-                        btnText = "Install"
-                    }
+			if installBtn.Clicked(gtx) {
+				switch state {
+				case stateIdle:
+					setStatus(stateInstalling, 0, "Preparing...")
+					go performInstallation(meta, zipReader, w)
+				case stateDone, stateFailed:
+					os.Exit(0)
+				}
+			}
 
-                    btn := material.Button(th, installBtn, btnText)
-                    if currentState == StateInstalling {
-                        btn.Background = color.NRGBA{R: 200, G: 200, B: 200, A: 255}
-                    }
-                    return btn.Layout(gtx)
-                }),
-            )
-            e.Frame(gtx.Ops)
+			layout.Flex{Axis: layout.Vertical, Spacing: layout.SpaceAround}.Layout(gtx,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					ui.Lock()
+					defer ui.Unlock()
+					lbl := material.H6(th, ui.status)
+					lbl.Alignment = text.Middle
+					return lbl.Layout(gtx)
+				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					if state == stateInstalling {
+						ui.Lock()
+						p := ui.progress
+						ui.Unlock()
+						return material.ProgressBar(th, p).Layout(gtx)
+					}
+					return layout.Dimensions{}
+				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					var btnText string
+					switch state {
+					case stateInstalling:
+						btnText = "Installing..."
+					case stateDone:
+						btnText = "Close"
+					case stateFailed:
+						btnText = "Exit"
+					default:
+						btnText = "Install"
+					}
+					btn := material.Button(th, installBtn, btnText)
+					if state == stateInstalling {
+						btn.Background = color.NRGBA{R: 200, G: 200, B: 200, A: 255}
+					}
+					return btn.Layout(gtx)
+				}),
+			)
+			e.Frame(gtx.Ops)
 
-        case app.DestroyEvent: // Изменено с system.DestroyEvent
-            os.Exit(0)
-        }
-    }
+		case app.DestroyEvent:
+			os.Exit(0)
+		}
+	}
+}
+
+func installDir(meta metadata.Metadata) string {
+	return filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", meta.AppName)
 }
 
 func performInstallation(meta metadata.Metadata, zipReader *zip.Reader, w *app.Window) {
-    localAppData := os.Getenv("LOCALAPPDATA")
-    installDir := filepath.Join(localAppData, "Programs", meta.AppName)
-    os.MkdirAll(installDir, 0755)
+	fail := func(err error) {
+		log.Printf("installation failed: %v", err)
+		setStatus(stateFailed, 0, "Installation failed. See install_log.txt.")
+		w.Invalidate()
+	}
 
-    totalFiles := len(zipReader.File)
-    for i, f := range zipReader.File {
-        uiMutex.Lock()
-        statusText = fmt.Sprintf("Extracting: %s (%d/%d)", f.Name, i+1, totalFiles)
-        progressValue = float32(i) / float32(totalFiles)
-        uiMutex.Unlock()
-        w.Invalidate()
+	dir := installDir(meta)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fail(fmt.Errorf("creating install directory: %w", err))
+		return
+	}
 
-        targetPath := filepath.Join(installDir, f.Name)
-        if f.FileInfo().IsDir() {
-            os.MkdirAll(targetPath, 0755)
-            continue
-        }
-        os.MkdirAll(filepath.Dir(targetPath), 0755)
+	err := install.ExtractAll(zipReader, dir, func(name string, index, total int) {
+		setStatus(stateInstalling, float32(index)/float32(total),
+			fmt.Sprintf("Extracting: %s (%d/%d)", name, index, total))
+		w.Invalidate()
+	})
+	if err != nil {
+		fail(err)
+		return
+	}
 
-        outFile, _ := os.Create(targetPath)
-        rc, _ := f.Open()
-        io.Copy(outFile, rc)
-        outFile.Close()
-        rc.Close()
-    }
+	// The uninstaller is a copy of this same binary; --uninstall switches mode.
+	exePath, err := os.Executable()
+	if err != nil {
+		fail(err)
+		return
+	}
+	uninstallPath := filepath.Join(dir, "uninstall.exe")
+	if err := copyFile(exePath, uninstallPath); err != nil {
+		fail(fmt.Errorf("installing uninstaller: %w", err))
+		return
+	}
 
-    exePath, _ := os.Executable()
-    uninstallPath := filepath.Join(installDir, "uninstall.exe")
-    copyFile(exePath, uninstallPath)
+	mainExePath := filepath.Join(dir, filepath.FromSlash(meta.MainExe))
+	if err := createShortcut(meta.AppName, mainExePath); err != nil {
+		log.Printf("warning: shortcut not created: %v", err)
+	}
+	if err := registerUninstaller(meta, dir, uninstallPath, mainExePath); err != nil {
+		log.Printf("warning: uninstaller not registered: %v", err)
+	}
 
-    createShortcut(meta.AppName, filepath.Join(installDir, meta.MainExe))
-    registerUninstaller(meta.AppName, meta.AppVersion, installDir, uninstallPath)
-
-    uiMutex.Lock()
-    statusText = "Installation completed successfully!"
-    progressValue = 1.0
-    currentState = StateDone
-    uiMutex.Unlock()
-    w.Invalidate()
+	log.Printf("installed %s %s to %s", meta.AppName, meta.AppVersion, dir)
+	setStatus(stateDone, 1, "Installation completed successfully!")
+	w.Invalidate()
 }
 
-func runUninstaller() {
-    meta, _, _ := getEmbeddedData()
-    localAppData := os.Getenv("LOCALAPPDATA")
-    installDir := filepath.Join(localAppData, "Programs", meta.AppName)
-    uninstallPath := filepath.Join(installDir, "uninstall.exe")
+func runUninstaller() error {
+	meta, _, err := loadPayload()
+	if err != nil {
+		return fmt.Errorf("reading metadata: %w", err)
+	}
+	dir := installDir(meta)
+	uninstallPath := filepath.Join(dir, "uninstall.exe")
 
-    registry.DeleteKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Uninstall\`+meta.AppName)
-    desktopShortcut := filepath.Join(os.Getenv("USERPROFILE"), "Desktop", meta.AppName+".lnk")
-    os.Remove(desktopShortcut)
+	_ = registry.DeleteKey(registry.CURRENT_USER,
+		`Software\Microsoft\Windows\CurrentVersion\Uninstall\`+meta.AppName)
+	_ = os.Remove(filepath.Join(os.Getenv("USERPROFILE"), "Desktop", meta.AppName+".lnk"))
 
-    filepath.Walk(installDir, func(path string, info os.FileInfo, err error) error {
-        if path != uninstallPath && !info.IsDir() {
-            os.Remove(path)
-        }
-        return nil
-    })
+	// Remove everything except the running uninstaller itself.
+	walkErr := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if path != uninstallPath && !info.IsDir() {
+			if err := os.Remove(path); err != nil {
+				log.Printf("warning: could not remove %s: %v", path, err)
+			}
+		}
+		return nil
+	})
+	if walkErr != nil && !os.IsNotExist(walkErr) {
+		log.Printf("warning: cleanup incomplete: %v", walkErr)
+	}
 
-    cmdStr := fmt.Sprintf(`timeout /t 2 > nul & del /f /q "%s" & rmdir /s /q "%s"`, uninstallPath, installDir)
-    cmd := exec.Command("cmd", "/c", cmdStr)
-    cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-    cmd.Start()
-    os.Exit(0)
+	// Self-delete after a short delay, then remove the install tree.
+	cmdStr := fmt.Sprintf(`timeout /t 2 > nul & del /f /q "%s" & rmdir /s /q "%s"`, uninstallPath, dir)
+	cmd := exec.Command("cmd", "/c", cmdStr)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("scheduling self-delete: %w", err)
+	}
+	return nil
 }
 
-func copyFile(src, dst string) {
-    in, _ := os.Open(src)
-    defer in.Close()
-    out, _ := os.Create(dst)
-    defer out.Close()
-    io.Copy(out, in)
+func copyFile(src, dst string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	_, err = io.Copy(out, in)
+	return err
 }
 
-func createShortcut(appName, targetExe string) {
-    desktopDir, _ := os.UserHomeDir()
-    shortcutPath := filepath.Join(desktopDir, "Desktop", appName+".lnk")
-    psScript := fmt.Sprintf(
-        `$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut("%s"); $sc.TargetPath = "%s"; $sc.WorkingDirectory = "%s"; $sc.Save()`,
-        shortcutPath, targetExe, filepath.Dir(targetExe),
-    )
-    exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-Command", psScript).Run()
+func createShortcut(appName, targetExe string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	shortcutPath := filepath.Join(home, "Desktop", appName+".lnk")
+	psScript := fmt.Sprintf(
+		`$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut("%s"); $sc.TargetPath = "%s"; $sc.WorkingDirectory = "%s"; $sc.Save()`,
+		shortcutPath, targetExe, filepath.Dir(targetExe),
+	)
+	out, err := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psScript).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, out)
+	}
+	return nil
 }
 
-func registerUninstaller(appName, appVersion, installDir, uninstallPath string) {
-    keyPath := `Software\Microsoft\Windows\CurrentVersion\Uninstall\` + appName
-    k, _, err := registry.CreateKey(registry.CURRENT_USER, keyPath, registry.SET_VALUE|registry.CREATE_SUB_KEY)
-    if err != nil {
-        return
-    }
-    defer k.Close()
+func registerUninstaller(meta metadata.Metadata, dir, uninstallPath, mainExePath string) error {
+	keyPath := `Software\Microsoft\Windows\CurrentVersion\Uninstall\` + meta.AppName
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, keyPath, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
 
-    k.SetStringValue("DisplayName", appName)
-    k.SetStringValue("DisplayVersion", appVersion)
-    k.SetStringValue("InstallLocation", installDir)
-    k.SetStringValue("UninstallString", `"`+uninstallPath+`" --uninstall`)
-    k.SetStringValue("DisplayIcon", filepath.Join(installDir, appName+".exe"))
+	values := map[string]string{
+		"DisplayName":     meta.AppName,
+		"DisplayVersion":  meta.AppVersion,
+		"InstallLocation": dir,
+		"UninstallString": `"` + uninstallPath + `" --uninstall`,
+		"DisplayIcon":     mainExePath,
+	}
+	if meta.Publisher != "" {
+		values["Publisher"] = meta.Publisher
+	}
+	for name, value := range values {
+		if err := k.SetStringValue(name, value); err != nil {
+			return fmt.Errorf("setting %s: %w", name, err)
+		}
+	}
+	return nil
 }
