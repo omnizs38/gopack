@@ -1,0 +1,9 @@
+{
+  "src": "./myapp",
+  "out": "setup.exe",
+  "name": "MyApp",
+  "version": "1.0.0",
+  "exe": "myapp.exe",
+  "publisher": "Your Name",
+  "template": "./extractor_template.exe"
+}

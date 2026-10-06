@@ -1,4 +1,4 @@
-module gopack
+module github.com/omnizs38/gopack
 
 go 1.26.4
 
